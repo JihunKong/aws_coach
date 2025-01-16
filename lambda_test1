@@ -1,0 +1,523 @@
+import json
+import boto3
+import logging
+from datetime import datetime, timedelta
+import os
+import aiohttp
+import asyncio
+from botocore.config import Config
+from functools import lru_cache
+import time
+
+# 로깅 설정
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+# AWS 설정
+boto_config = Config(
+    retries=dict(
+        max_attempts=3,
+        mode='adaptive'
+    ),
+    max_pool_connections=50
+)
+
+# AWS 클라이언트
+dynamodb = boto3.resource('dynamodb', config=boto_config)
+sessions_table = dynamodb.Table('chatbot_sessions')
+
+# 코칭 단계 정의
+COACHING_STAGES = {
+    'Trust': {
+        'purpose': '신뢰 관계 구축 및 목표 설정',
+        'objectives': [
+            '래포 형성',
+            '현재 상황 파악',
+            '코칭 목표 명확화',
+            '기대치 설정'
+        ],
+        'transition_criteria': {
+            'rapport_level': 'high',
+            'goal_clarity': 'defined',
+            'commitment': 'expressed'
+        }
+    },
+    'Discover': {
+        'purpose': '깊이 있는 탐색과 통찰',
+        'objectives': [
+            '현재 상황의 root cause 분석',
+            '내면의 동기 발견',
+            '장애물과 자원 파악',
+            '가능성 탐색'
+        ],
+        'transition_criteria': {
+            'insight_depth': 'substantial',
+            'self_awareness': 'increased',
+            'options_generated': 'sufficient'
+        }
+    },
+    'Design': {
+        'purpose': '실행 계획 수립',
+        'objectives': [
+            '구체적 행동 계획 수립',
+            '장애물 극복 전략 개발',
+            '성공 지표 설정',
+            '책임감 부여'
+        ],
+        'transition_criteria': {
+            'plan_specificity': 'high',
+            'commitment_level': 'strong',
+            'accountability': 'established'
+        }
+    },
+    'Success': {
+        'purpose': '실행과 성과 검토',
+        'objectives': [
+            '진행 상황 점검',
+            '학습 내용 정리',
+            '성과 축하',
+            '다음 단계 계획'
+        ],
+        'completion_criteria': {
+            'goals_achieved': 'verified',
+            'learning_consolidated': 'complete',
+            'next_steps': 'planned'
+        }
+    }
+}
+
+class SessionManager:
+    """세션 관리 클래스"""
+    def __init__(self):
+        self.cache = {}
+    
+    async def get_session(self, user_id):
+        """세션 데이터 조회 (캐시 활용)"""
+        if user_id in self.cache:
+            session_data = self.cache[user_id]
+            if datetime.now() < session_data['cache_expires']:
+                return session_data
+        
+        try:
+            response = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: sessions_table.get_item(Key={'user_id': user_id})
+            )
+            
+            current_time = datetime.now()
+            
+            if 'Item' not in response:
+                session_data = {
+                    'user_id': user_id,
+                    'current_stage': 'Trust',
+                    'conversation_history': [],
+                    'coaching_goals': [],
+                    'action_items': [],
+                    'progress_metrics': {},
+                    'session_summary': {},
+                    'summary_history': [],
+                    'last_interaction': current_time.isoformat(),
+                    'ttl': int((current_time + timedelta(days=7)).timestamp())
+                }
+                await self.update_session(session_data)
+            else:
+                session_data = response['Item']
+            
+            session_data['cache_expires'] = current_time + timedelta(minutes=5)
+            self.cache[user_id] = session_data
+            return session_data
+            
+        except Exception as e:
+            logger.error(f"Error getting session data: {str(e)}", exc_info=True)
+            return self.get_default_session(user_id)
+    
+    def get_default_session(self, user_id):
+        """기본 세션 데이터 생성"""
+        return {
+            'user_id': user_id,
+            'current_stage': 'Trust',
+            'conversation_history': [],
+            'coaching_goals': [],
+            'action_items': [],
+            'progress_metrics': {},
+            'session_summary': {},
+            'summary_history': [],
+            'last_interaction': datetime.now().isoformat()
+        }
+    
+    async def update_session(self, session_data):
+        """세션 데이터 업데이트"""
+        try:
+            user_id = session_data['user_id']
+            session_data['last_interaction'] = datetime.now().isoformat()
+            
+            # 캐시 업데이트
+            self.cache[user_id] = session_data
+            session_data['cache_expires'] = datetime.now() + timedelta(minutes=5)
+            
+            # DynamoDB 업데이트
+            await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: sessions_table.put_item(Item=session_data)
+            )
+        except Exception as e:
+            logger.error(f"Error updating session data: {str(e)}", exc_info=True)
+            raise
+
+    async def update_session_summary(self, session_data):
+        """세션 요약 업데이트"""
+        try:
+            if len(session_data['conversation_history']) % 5 == 0:
+                previous_summary = session_data.get('session_summary', {})
+                new_summary = await summarize_session(
+                    session_data['conversation_history'],
+                    previous_summary
+                )
+                
+                if new_summary:
+                    session_data['session_summary'] = new_summary
+                    if 'summary_history' not in session_data:
+                        session_data['summary_history'] = []
+                    session_data['summary_history'].append({
+                        'timestamp': datetime.now().isoformat(),
+                        'summary': new_summary
+                    })
+                    session_data['summary_history'] = session_data['summary_history'][-5:]
+                    
+                    changes = self.detect_significant_changes(
+                        previous_summary,
+                        new_summary
+                    )
+                    if changes:
+                        session_data['significant_changes'] = changes
+        
+        except Exception as e:
+            logger.error(f"Error updating session summary: {str(e)}", exc_info=True)
+
+    def detect_significant_changes(self, old_summary, new_summary):
+        """주요 변화 감지"""
+        changes = []
+        
+        old_themes = set(old_summary.get('key_themes', []))
+        new_themes = set(new_summary.get('key_themes', []))
+        if old_themes != new_themes:
+            changes.append({
+                'type': 'themes',
+                'added': list(new_themes - old_themes),
+                'removed': list(old_themes - new_themes)
+            })
+        
+        if old_summary.get('emotional_state') != new_summary.get('emotional_state'):
+            changes.append({
+                'type': 'emotional_state',
+                'from': old_summary.get('emotional_state'),
+                'to': new_summary.get('emotional_state')
+            })
+        
+        old_insights = set(old_summary.get('insights', []))
+        new_insights = set(new_summary.get('insights', []))
+        new_found_insights = new_insights - old_insights
+        if new_found_insights:
+            changes.append({
+                'type': 'insights',
+                'new': list(new_found_insights)
+            })
+        
+        return changes if changes else None
+
+async def summarize_session(conversation_history, previous_summary=None):
+    """대화 내용을 요약하고 핵심 인사이트 추출"""
+    try:
+        summary_prompt = f"""이전 요약: {previous_summary if previous_summary else '없음'}
+
+최근 대화:
+{conversation_history[-5:]}
+
+다음 내용을 JSON 형식으로 요약해주세요:
+1. key_themes: 주요 테마 (최대 3개)
+2. insights: 주요 통찰 (최대 3개)
+3. challenges: 현재 도전 과제
+4. progress: 진전 사항
+5. action_items: 실행 계획
+6. emotional_state: 감정 상태 변화
+
+이전 요약이 있다면, 새로운 대화 내용을 고려하여 기존 요약을 업데이트해주세요."""
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                'https://api.anthropic.com/v1/messages',
+                json={
+                    "model": "claude-3-opus-20240229",
+                    "max_tokens": 500,
+                    "messages": [{"role": "user", "content": summary_prompt}],
+                    "temperature": 0.7
+                },
+                headers={
+                    "x-api-key": os.environ["ANTHROPIC_API_KEY"],
+                    "anthropic-version": "2024-01-01"
+                }
+            ) as response:
+                result = await response.json()
+                return json.loads(result['content'][0]['text'])
+    except Exception as e:
+        logger.error(f"Error in summarize_session: {str(e)}", exc_info=True)
+        return None
+
+async def generate_coaching_prompt(stage, session_data, user_message, session_summary=None):
+    """요약 정보를 포함한 프롬프트 생성"""
+    current_stage = COACHING_STAGES[stage]
+    recent_history = session_data['conversation_history'][-3:]
+    
+    summary_context = """
+세션 요약:
+- 주요 테마: {themes}
+- 핵심 통찰: {insights}
+- 현재 도전과제: {challenges}
+- 감정 상태: {emotional_state}
+- 진전 사항: {progress}
+""".format(
+        themes=', '.join(session_summary.get('key_themes', [])),
+        insights=', '.join(session_summary.get('insights', [])),
+        challenges=session_summary.get('challenges', '정보 없음'),
+        emotional_state=session_summary.get('emotional_state', '정보 없음'),
+        progress=session_summary.get('progress', '정보 없음')
+    ) if session_summary else "세션 요약 정보 없음"
+
+    prompt = f"""당신은 전문적인 교육 코치입니다. 다음 맥락을 바탕으로 학생을 코칭해주세요.
+
+현재 코칭 상황:
+- 단계: {stage} ({current_stage['purpose']})
+- 단계별 목표: {', '.join(current_stage['objectives'])}
+- 코칭 목표: {', '.join(session_data.get('coaching_goals', ['아직 설정되지 않음']))}
+
+{summary_context}
+
+최근 대화:
+{recent_history}
+
+학생의 메시지: {user_message}
+
+JSON 형식으로 응답해주세요:
+{
+    "analysis": {
+        "stage_progress": "early/middle/late",
+        "objectives_met": [...],
+        "transition_readiness": bool,
+        "key_insights": [...]
+    },
+    "response": {
+        "coaching_message": "코칭 메시지",
+        "next_question": "다음 질문"
+    },
+    "meta": {
+        "suggested_focus": "다음 초점",
+        "notes": "다음 세션을 위한 메모"
+    }
+}"""
+
+    return prompt
+
+async def process_with_claude(user_message, session_data):
+    """Claude API를 통한 코칭 응답 생성"""
+    try:
+        current_stage = session_data['current_stage']
+        session_summary = session_data.get('session_summary')
+        prompt = await generate_coaching_prompt(
+            current_stage,
+            session_data,
+            user_message,
+            session_summary
+        )
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                'https://api.anthropic.com/v1/messages',
+                json={
+                    "model": "claude-3-opus-20240229",
+                    "max_tokens": 1000,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.7
+                },
+                headers={
+                    "x-api-key": os.environ["ANTHROPIC_API_KEY"],
+                    "anthropic-version": "2024-01-01"
+                },
+                timeout=aiohttp.ClientTimeout(total=25)
+            ) as response:
+                result = await response.json()
+                return json.loads(result['content'][0]['text'])
+                
+    except asyncio.TimeoutError:
+        logger.warning("Claude API timeout, using fallback response")
+        return get_fallback_response(session_data)
+    except Exception as e:
+        logger.error(f"Error in process_with_claude: {str(e)}", exc_info=True)
+        return get_fallback_response(session_data)
+
+def get_fallback_response(session_data):
+    """폴백 응답 생성"""
+    stage = session_data['current_stage']
+    fallback_responses = {
+        'Trust': {
+            'coaching_message': '네, 말씀해주셔서 감사합니다. 더 자세히 들려주실 수 있나요?',
+            'next_question': '어떤 부분이 가장 중요하다고 생각하시나요?'
+        },
+        'Discover': {
+            'coaching_message': '흥미로운 관점이네요. 구체적인 예시가 있을까요?',
+            'next_question': '이런 상황에서 어떤 감정이 드시나요?'
+        },
+        'Design': {
+            'coaching_message': '좋은 생각입니다. 이것을 어떻게 실천해보고 싶으신가요?',
+            'next_question': '첫 번째 단계는 무엇이 될 수 있을까요?'
+        },
+        'Success': {
+            'coaching_message': '멋진 성과네요. 다음 단계는 어떻게 계획하고 계신가요?',
+            'next_question': '이 경험에서 어떤 교훈을 얻으셨나요?'
+        }
+    }
+    
+    default_response = fallback_responses['Trust']
+    selected_response = fallback_responses.get(stage, default_response)
+    
+    return {
+        'analysis': {
+            'stage_progress': 'middle',
+            'objectives_met': [],
+            'transition_readiness': False,
+            'key_insights': []
+        },
+        'response': selected_response,
+        'meta': {
+            'suggested_focus': '현재 상황 탐색',
+            'notes': '시스템 응답 지연으로 인한 폴백 응답 사용'
+        }
+    }
+
+async def check_stage_transition(analysis_result, current_stage):
+    """단계 전환 필요성 확인"""
+    if (analysis_result['analysis']['transition_readiness'] and 
+        analysis_result['analysis']['stage_progress'] == 'late'):
+        
+        stage_sequence = ['Trust', 'Discover', 'Design', 'Success']
+        current_index = stage_sequence.index(current_stage)
+        
+        if current_index < len(stage_sequence) - 1:
+            return stage_sequence[current_index + 1]
+    
+    return current_stage
+
+async def lambda_handler(event, context):
+    """Lambda 핸들러"""
+    try:
+        logger.info(f"Received event: {json.dumps(event)}")
+        
+        # 요청 처리
+        try:
+            body = json.loads(event.get('body', '{}')) if isinstance(event.get('body'), str) else event.get('body', {})
+        except json.JSONDecodeError:
+            body = {}
+        
+        logger.info(f"Parsed body: {json.dumps(body)}")
+        
+        # 테스트 이벤트 처리
+        if 'test' in event:
+            return {
+                'statusCode': 200,
+                'body': json.dumps({'message': 'Test event received successfully'})
+            }
+        
+        # 유효성 검사
+        if 'userRequest' not in body:
+            return {
+                'statusCode': 400,
+                'body': json.dumps({'error': 'Invalid request format'})
+            }
+        
+        user_id = body['userRequest']['user']['id']
+        user_message = body['userRequest']['utterance']
+        
+        # 콜백 처리
+        if not body.get('isCallback'):
+            return {
+                'statusCode': 200,
+                'body': json.dumps({
+                    'version': '2.0',
+                    'useCallback': True,
+                    'data': {
+                        'text': '잠시만 기다려주세요...'
+                    }
+                })
+            }
+        
+        # 세션 관리
+        session_manager = SessionManager()
+        session_data = await session_manager.get_session(user_id)
+        
+        # 세션 요약 업데이트
+        await session_manager.update_session_summary(session_data)
+        
+        # Claude를 통한 응답 생성
+        coaching_result = await process_with_claude(
+            user_message,
+            session_data
+        )
+        
+        # 단계 전환 확인
+        next_stage = await check_stage_transition(
+            coaching_result,
+            session_data['current_stage']
+        )
+        
+        # 세션 업데이트
+        session_data['current_stage'] = next_stage
+        session_data['conversation_history'].append(f"학생: {user_message}")
+        session_data['conversation_history'].append(f"코치: {coaching_result['response']['coaching_message']}")
+        
+        if len(session_data['conversation_history']) > 20:
+            session_data['conversation_history'] = session_data['conversation_history'][-20:]
+        
+        await session_manager.update_session(session_data)
+        
+        # 응답 생성
+        response_body = {
+            "version": "2.0",
+            "template": {
+                "outputs": [
+                    {
+                        "simpleText": {
+                            "text": coaching_result['response']['coaching_message']
+                        }
+                    }
+                ]
+            }
+        }
+        
+        return {
+            'statusCode': 200,
+            'body': json.dumps(response_body, ensure_ascii=False),
+            'headers': {
+                'Content-Type': 'application/json'
+            }
+        }
+
+    except Exception as e:
+        logger.error(f"Error in lambda_handler: {str(e)}", exc_info=True)
+        error_response = {
+            "version": "2.0",
+            "template": {
+                "outputs": [
+                    {
+                        "simpleText": {
+                            "text": "죄송합니다. 일시적인 오류가 발생했습니다. 잠시 후 다시 시도해주세요."
+                        }
+                    }
+                ]
+            }
+        }
+        return {
+            'statusCode': 200,
+            'body': json.dumps(error_response, ensure_ascii=False),
+            'headers': {
+                'Content-Type': 'application/json'
+            }
+        }
