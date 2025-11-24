@@ -1,0 +1,964 @@
+import json
+import logging
+import boto3
+import urllib3
+import os
+import re
+from botocore.config import Config
+from datetime import datetime, timedelta
+from urllib3.util.retry import Retry
+from boto3.dynamodb.conditions import Key
+
+# 로깅 설정
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+# HTTP 클라이언트 설정
+http = urllib3.PoolManager(
+    maxsize=50,
+    retries=Retry(
+        total=3,
+        backoff_factor=1,
+        status_forcelist=[500, 502, 503, 504],
+        allowed_methods=["POST"]
+    ),
+    timeout=30.0
+)
+
+# AWS 설정
+boto_config = Config(
+    retries={'max_attempts': 3, 'mode': 'adaptive'},
+    max_pool_connections=50
+)
+dynamodb = boto3.resource('dynamodb', config=boto_config)
+sessions_table = dynamodb.Table('chatbot_sessions')
+completed_sessions_table = dynamodb.Table('chatbot_completed_sessions')  # 완료된 세션 저장용
+
+# 코칭 단계 정의
+COACHING_STAGES = [
+    "신뢰 형성",
+    "현실 탐색",
+    "목표 설정",
+    "대안 탐색", 
+    "실행 계획",
+    "정리 및 마무리"
+]
+
+# 세션 리셋 키워드 패턴
+RESET_PATTERNS = [
+    r'다시\s*시작',
+    r'처음부터',
+    r'새로\s*시작',
+    r'리셋',
+    r'reset',
+    r'restart',
+    r'다시\s*해',
+    r'새로\s*해',
+    r'코칭\s*다시',
+    r'처음으로'
+]
+
+# 종료 키워드 패턴
+END_PATTERNS = [
+    r'종료',
+    r'끝',
+    r'그만',
+    r'stop',
+    r'exit',
+    r'quit',
+    r'코칭\s*끝',
+    r'마무리',
+    r'그만\s*하',
+]
+
+# 재개 확인 키워드
+CONTINUE_PATTERNS = [
+    r'계속',
+    r'이어서',
+    r'continue',
+    r'네',
+    r'yes',
+    r'좋아',
+    r'계속할게'
+]
+
+NEW_SESSION_PATTERNS = [
+    r'새로',
+    r'다시',
+    r'새\s*주제',
+    r'new',
+    r'아니',
+    r'no',
+    r'다른'
+]
+
+# 위기 키워드 패턴
+CRISIS_PATTERNS = [
+    r'자해', r'자살', r'죽고\s*싶', r'사라지고\s*싶',
+    r'폭력', r'학대', r'괴롭힘', r'왕따', r'때리', r'맞아',
+    r'혼자', r'외로워', r'아무도\s*없'
+]
+
+# 단계별 프롬프트 정의 (도움요청 주제 특화)
+STAGE_PROMPTS = {
+    "신뢰 형성": """
+당신은 학생들의 마음을 이해하는 AI 코치입니다. 지금은 '신뢰 형성' 단계입니다.
+이 단계에서는 학생과의 편안한 관계를 형성하는 것이 목표입니다.
+
+다음 원칙을 따라주세요:
+1. 학생을 따뜻하게 환영하고 편안한 분위기를 만드세요
+2. 학생의 현재 상태(감정, 생각)에 관심을 보이세요
+3. 친근하고 편안한 말투를 사용하되, 존댓말을 유지하세요
+4. 학교 생활과 관련된 질문을 자연스럽게 포함하세요
+5. 판단하지 않고 수용적인 태도를 보이세요
+
+⚠️ 매우 중요한 규칙들:
+- 반드시 한 번에 단 하나의 질문만 하세요!
+- 절대 두 개 이상의 질문을 연속으로 하지 마세요
+- "(학생의 답변을 기다립니다)" 같은 메타 표현을 절대 사용하지 마세요
+- 한 문장으로 끝내고, 학생의 답변을 기다리세요
+- 설명, 조언, 예시, 해결책 제시는 하지 마세요
+- 학생이 어떤 이야기를 하든 그것부터 공감하고 받아들이세요
+
+{previous_context}
+
+이 단계에서 사용할 수 있는 질문 예시 (하나만 선택):
+- 오늘 하루는 어땠나요?
+- 요즘 학교생활은 어떤가요?
+- 지금 기분이 어떤가요?
+- 오늘 이 시간에 어떤 이야기를 나누고 싶나요?
+- 최근에 마음에 걸리는 일이 있나요?
+
+학생이 먼저 다른 주제(화장실, 짜증난 일 등)를 이야기하면, 그것에 대해 먼저 공감하고 자연스럽게 대화를 이어가세요.
+최소 2번 이상의 대화 턴을 통해 학생에 대해 알아가세요.
+""",
+
+    "현실 탐색": """
+당신은 학생들의 마음을 이해하는 AI 코치입니다. 지금은 '현실 탐색' 단계입니다.
+이 단계에서는 학생이 도움이 필요한 상황을 구체적으로 탐색하는 것이 목표입니다.
+
+다음 원칙을 따라주세요:
+1. 현재 어려움을 겪고 있는 상황에 대해 구체적으로 질문하세요
+2. 혼자 해결하기 어려운 부분이 무엇인지 탐색하세요
+3. 도움을 받지 못하는 이유나 장벽을 파악하세요
+4. 학교 생활에서의 구체적인 어려움에 주목하세요
+5. 감정과 생각을 구분해서 탐색하도록 도와주세요
+
+⚠️ 매우 중요한 규칙들:
+- 반드시 한 번에 단 하나의 질문만 하세요!
+- 절대 두 개 이상의 질문을 연속으로 하지 마세요
+- "(학생의 답변을 기다립니다)" 같은 메타 표현을 절대 사용하지 마세요
+- 한 문장으로 끝내고, 학생의 답변을 기다리세요
+- 설명, 조언, 예시, 해결책 제시는 하지 마세요
+
+이 단계에서 사용할 수 있는 질문 예시 (하나만 선택):
+- 요즘 가장 힘든 일은 무엇인가요?
+- 이 문제를 혼자 해결하기 어려운 이유는 무엇인가요?
+- 이 상황에서 어떤 감정을 느끼나요?
+- 누군가의 도움이 있다면 어떤 점이 달라질까요?
+- 도움을 요청하기 어렵게 만드는 것은 무엇인가요?
+- 이전에 비슷한 어려움을 겪은 적이 있나요?
+
+최소 3번 이상의 대화 턴을 통해 학생의 상황을 깊이 있게 탐색하세요.
+""",
+
+    "목표 설정": """
+당신은 학생들의 마음을 이해하는 AI 코치입니다. 지금은 '목표 설정' 단계입니다.
+이 단계에서는 학생이 원하는 변화와 도움받고 싶은 부분을 명확히 하는 것이 목표입니다.
+
+다음 원칙을 따라주세요:
+1. 학생이 원하는 변화나 결과에 대해 질문하세요
+2. 어떤 도움을 받고 싶은지 구체적으로 탐색하세요
+3. 도움을 받았을 때의 모습을 상상하도록 도와주세요
+4. 작고 실현 가능한 목표를 세우도록 격려하세요
+5. 목표가 학생에게 왜 중요한지 확인하세요
+
+⚠️ 매우 중요한 규칙들:
+- 반드시 한 번에 단 하나의 질문만 하세요!
+- 절대 두 개 이상의 질문을 연속으로 하지 마세요
+- "(학생의 답변을 기다립니다)" 같은 메타 표현을 절대 사용하지 마세요
+- 한 문장으로 끝내고, 학생의 답변을 기다리세요
+- 설명, 조언, 예시, 해결책 제시는 하지 마세요
+
+이 단계에서 사용할 수 있는 질문 예시 (하나만 선택):
+- 이 상황에서 어떤 변화를 원하나요?
+- 어떤 도움을 받으면 좋을까요?
+- 문제가 해결된다면 어떤 모습일까요?
+- 가장 먼저 바뀌었으면 하는 것은 무엇인가요?
+- 이 목표가 왜 중요한가요?
+- 작은 변화라도 괜찮은데, 무엇부터 시작하고 싶나요?
+
+최소 2번 이상의 대화 턴을 통해 학생의 목표를 명확하게 설정하도록 도와주세요.
+""",
+
+    "대안 탐색": """
+당신은 학생들의 마음을 이해하는 AI 코치입니다. 지금은 '대안 탐색' 단계입니다.
+이 단계에서는 학생이 도움을 받을 수 있는 다양한 방법과 사람들을 탐색하는 것이 목표입니다.
+
+다음 원칙을 따라주세요:
+1. 도움을 받을 수 있는 다양한 사람들을 떠올리도록 질문하세요
+2. 각각의 사람에게 어떻게 도움을 요청할지 탐색하세요
+3. 도움 요청의 다양한 방법(직접, 메시지, 편지 등)을 고려하도록 하세요
+4. 과거에 도움을 받았던 긍정적 경험을 활용하세요
+5. 도움 요청이 어렵게 느껴지는 이유를 이해하고 대안을 찾아보세요
+
+⚠️ 매우 중요한 규칙들:
+- 반드시 한 번에 단 하나의 질문만 하세요!
+- 절대 두 개 이상의 질문을 연속으로 하지 마세요
+- "(학생의 답변을 기다립니다)" 같은 메타 표현을 절대 사용하지 마세요
+- 한 문장으로 끝내고, 학생의 답변을 기다리세요
+- 설명, 조언, 예시, 해결책 제시는 하지 마세요
+
+이 단계에서 사용할 수 있는 질문 예시 (하나만 선택):
+- 주변에 도움을 줄 수 있는 사람은 누가 있을까요?
+- 그 사람에게 어떻게 말하면 좋을까요?
+- 직접 말하기 어렵다면 어떤 방법이 있을까요?
+- 예전에 도움을 받았던 좋은 경험이 있나요?
+- 친구가 같은 상황이라면 누구에게 도움을 구하라고 할까요?
+- 작은 도움이라도 받을 수 있는 방법은 무엇일까요?
+
+최소 3번 이상의 대화 턴을 통해 학생이 다양한 도움 요청 방법을 탐색하도록 도와주세요.
+""",
+
+    "실행 계획": """
+당신은 학생들의 마음을 이해하는 AI 코치입니다. 지금은 '실행 계획' 단계입니다.
+이 단계에서는 학생이 실제로 도움을 요청할 수 있는 구체적인 계획을 세우는 것이 목표입니다.
+
+다음 원칙을 따라주세요:
+1. 구체적인 도움 요청 계획을 세우도록 질문하세요
+2. 언제, 어디서, 어떻게 도움을 요청할지 구체화하세요
+3. 도움 요청할 때 사용할 말을 연습하도록 도와주세요
+4. 예상되는 어려움과 대처 방법을 준비하세요
+5. 작은 첫걸음부터 시작하도록 격려하세요
+
+⚠️ 매우 중요한 규칙들:
+- 반드시 한 번에 단 하나의 질문만 하세요!
+- 절대 두 개 이상의 질문을 연속으로 하지 마세요
+- "(학생의 답변을 기다립니다)" 같은 메타 표현을 절대 사용하지 마세요
+- 한 문장으로 끝내고, 학생의 답변을 기다리세요
+- 설명, 조언, 예시, 해결책 제시는 하지 마세요
+
+이 단계에서 사용할 수 있는 질문 예시 (하나만 선택):
+- 누구에게 먼저 도움을 요청해볼까요?
+- 언제 그 사람과 이야기하면 좋을까요?
+- 첫 마디를 어떻게 시작하면 좋을까요?
+- 만약 거절당한다면 어떻게 할까요?
+- 오늘 당장 할 수 있는 작은 행동은 무엇일까요?
+- 용기를 내는 데 도움이 되는 것은 무엇일까요?
+
+최소 2번 이상의 대화 턴을 통해 학생이 실행 가능한 계획을 세우도록 도와주세요.
+""",
+
+    "정리 및 마무리": """
+당신은 학생들의 마음을 이해하는 AI 코치입니다. 지금은 '정리 및 마무리' 단계입니다.
+이 단계에서는 오늘 대화를 정리하고 학생의 용기와 성장을 격려하는 것이 목표입니다.
+
+다음 원칙을 따라주세요:
+1. 오늘 대화에서 얻은 통찰과 배움을 정리하도록 질문하세요
+2. 도움 요청에 대한 생각이 어떻게 변했는지 확인하세요
+3. 학생의 용기와 노력을 인정하고 격려하세요
+4. 친구들과 나눌 수 있는 내용을 준비하도록 도와주세요
+5. 실천 의지를 확인하고 응원하세요
+
+⚠️ 매우 중요한 규칙들:
+- 반드시 한 번에 단 하나의 질문만 하세요!
+- 절대 두 개 이상의 질문을 연속으로 하지 마세요
+- "(학생의 답변을 기다립니다)" 같은 메타 표현을 절대 사용하지 마세요
+- 한 문장으로 끝내고, 학생의 답변을 기다리세요
+- 설명, 조언, 예시, 해결책 제시는 하지 마세요
+
+이 단계에서 사용할 수 있는 질문 예시 (하나만 선택):
+- 오늘 대화에서 가장 중요한 깨달음은 무엇인가요?
+- 친구들과 나누고 싶은 이야기가 있다면 무엇인가요?
+- 도움 요청에 대한 생각이 어떻게 바뀌었나요?
+- 실제로 도움을 요청한다면 어떤 마음일까요?
+- 오늘 대화를 통해 어떤 용기를 얻었나요?
+- 자신에게 해주고 싶은 응원의 말은 무엇인가요?
+
+최소 2번 이상의 대화 턴을 통해 학생이 오늘 세션을 의미있게 마무리하도록 도와주세요.
+마지막에는 따뜻한 격려와 응원의 메시지를 전해주세요.
+"""
+}
+
+# 세션 만료 시간 설정 (24시간)
+SESSION_TIMEOUT_HOURS = 24
+RESUME_CHECK_HOURS = 1  # 1시간 이후 재개 확인
+SESSION_TIME_LIMIT_MINUTES = 18  # 수업 시간 고려한 제한 시간
+
+class SessionManager:
+    """사용자 세션을 관리하는 클래스."""
+    def __init__(self):
+        self.cache = {}
+
+    def is_session_expired(self, session_data: dict) -> bool:
+        """세션이 만료되었는지 확인합니다."""
+        try:
+            last_active = datetime.fromisoformat(session_data.get('last_active', ''))
+            timeout = datetime.utcnow() - timedelta(hours=SESSION_TIMEOUT_HOURS)
+            return last_active < timeout
+        except (ValueError, TypeError):
+            return True
+
+    def needs_resume_check(self, session_data: dict) -> bool:
+        """세션 재개 확인이 필요한지 확인합니다."""
+        try:
+            last_active = datetime.fromisoformat(session_data.get('last_active', ''))
+            resume_threshold = datetime.utcnow() - timedelta(hours=RESUME_CHECK_HOURS)
+            return last_active < resume_threshold
+        except (ValueError, TypeError):
+            return False
+
+    def get_session_duration(self, session_data: dict) -> int:
+        """세션 진행 시간을 분 단위로 반환합니다."""
+        try:
+            start_time = datetime.fromisoformat(session_data.get('session_start_time', ''))
+            duration = (datetime.utcnow() - start_time).total_seconds() / 60
+            return int(duration)
+        except:
+            return 0
+
+    def get_session(self, user_id: str) -> dict:
+        """DynamoDB에서 세션을 조회하거나 기본 세션을 생성한다."""
+        try:
+            session = sessions_table.get_item(Key={'user_id': user_id})
+            session_data = session.get('Item', None)
+            
+            # 세션이 없거나 만료된 경우 새 세션 생성
+            if session_data is None or self.is_session_expired(session_data):
+                session_data = self.create_new_session(user_id)
+                self.update_session(session_data)
+                
+            return session_data
+        except Exception as e:
+            logger.exception("Error getting session", exc_info=e)
+            return self.create_new_session(user_id)
+
+    def get_previous_sessions(self, user_id: str, limit: int = 5) -> list:
+        """사용자의 이전 완료된 세션들을 조회합니다."""
+        try:
+            response = completed_sessions_table.query(
+                KeyConditionExpression=Key('user_id').eq(user_id),
+                ScanIndexForward=False,  # 최신순으로 정렬
+                Limit=limit
+            )
+            return response.get('Items', [])
+        except Exception as e:
+            logger.error(f"Error getting previous sessions: {str(e)}")
+            return []
+
+    def save_completed_session(self, session_data: dict) -> None:
+        """완료된 세션을 저장합니다."""
+        try:
+            # 세션 요약 정보 추출
+            summary = self.extract_session_summary(session_data)
+            
+            completed_session = {
+                'user_id': session_data['user_id'],
+                'session_id': f"{session_data['user_id']}_{session_data['session_start_time']}",
+                'session_start_time': session_data['session_start_time'],
+                'session_end_time': datetime.utcnow().isoformat(),
+                'summary': summary,
+                'conversation_history': session_data.get('conversation_history', []),
+                'crisis_detected': session_data.get('crisis_detected', False)
+            }
+            
+            completed_sessions_table.put_item(Item=completed_session)
+            logger.info("Completed session saved successfully")
+        except Exception as e:
+            logger.error(f"Error saving completed session: {str(e)}")
+
+    def extract_session_summary(self, session_data: dict) -> dict:
+        """도움요청 주제에 맞춘 세션 요약을 추출합니다."""
+        conversation_history = session_data.get('conversation_history', [])
+        
+        summary = {
+            'difficulties': [],      # 어려움
+            'help_needs': [],       # 도움 필요 영역
+            'barriers': [],         # 도움요청 장벽
+            'helpers': [],          # 도움줄 수 있는 사람
+            'action_plans': [],     # 실천 계획
+            'insights': [],         # 통찰
+            'last_stage': COACHING_STAGES[int(session_data.get('current_stage', 0))]
+        }
+        
+        # 대화 내용에서 주요 정보 추출
+        for msg in conversation_history:
+            if msg.get('role') == 'user':
+                content = msg.get('content', '').lower()
+                
+                # 어려움 관련 키워드
+                if any(keyword in content for keyword in ['힘들', '어려', '못하', '안되', '걱정']):
+                    summary['difficulties'].append(content[:50])
+                
+                # 도움 필요 관련
+                if any(keyword in content for keyword in ['도움', '필요', '혼자', '같이']):
+                    summary['help_needs'].append(content[:50])
+                
+                # 도움요청 장벽
+                if any(keyword in content for keyword in ['부끄러', '민폐', '싫어', '거절', '무서']):
+                    summary['barriers'].append(content[:50])
+                
+                # 도움줄 수 있는 사람
+                if any(keyword in content for keyword in ['선생님', '부모님', '친구', '상담', '언니', '오빠', '누나', '형']):
+                    summary['helpers'].append(content[:50])
+                
+                # 실천 계획
+                if any(keyword in content for keyword in ['할게', '하겠', '해볼게', '시도']):
+                    summary['action_plans'].append(content[:50])
+        
+        # 각 카테고리별로 최대 3개만 저장
+        for key in summary:
+            if isinstance(summary[key], list):
+                summary[key] = summary[key][-3:]
+        
+        return summary
+
+    def create_new_session(self, user_id: str) -> dict:
+        """새 세션을 생성합니다."""
+        return {
+            'user_id': user_id,
+            'current_stage': 0,
+            'stage_question_count': 0,
+            'conversation_history': [],
+            'session_start_time': datetime.utcnow().isoformat(),
+            'last_active': datetime.utcnow().isoformat(),
+            'awaiting_resume_response': False,
+            'crisis_detected': False
+        }
+
+    def reset_session(self, user_id: str) -> dict:
+        """세션을 리셋하고 새 세션을 생성합니다."""
+        # 현재 세션을 완료된 세션으로 저장
+        current_session = self.get_session(user_id)
+        if current_session and len(current_session.get('conversation_history', [])) > 0:
+            self.save_completed_session(current_session)
+        
+        session_data = self.create_new_session(user_id)
+        self.update_session(session_data)
+        return session_data
+
+    def update_session(self, session_data: dict) -> None:
+        """DynamoDB에 세션 정보를 저장한다."""
+        try:
+            # current_stage와 stage_question_count를 int로 보장
+            session_data['current_stage'] = int(session_data.get('current_stage', 0))
+            session_data['stage_question_count'] = int(session_data.get('stage_question_count', 0))
+            session_data['last_active'] = datetime.utcnow().isoformat()
+            
+            sessions_table.put_item(Item=session_data)
+            logger.info("Session updated successfully")
+        except Exception as e:
+            logger.exception("Error updating session", exc_info=e)
+
+def get_previous_context(user_id: str, session_manager: SessionManager) -> str:
+    """이전 세션 정보를 기반으로 컨텍스트를 생성합니다."""
+    previous_sessions = session_manager.get_previous_sessions(user_id, limit=3)
+    
+    if not previous_sessions:
+        return ""
+    
+    context_parts = []
+    
+    # 가장 최근 세션 정보
+    if previous_sessions:
+        latest_session = previous_sessions[0]
+        summary = latest_session.get('summary', {})
+        
+        if summary.get('difficulties'):
+            context_parts.append(f"이전에 이야기했던 어려움: {', '.join(summary['difficulties'])}")
+        
+        if summary.get('action_plans'):
+            context_parts.append(f"지난번에 계획했던 것: {', '.join(summary['action_plans'])}")
+        
+        if summary.get('helpers'):
+            context_parts.append(f"도움받을 수 있다고 했던 사람: {', '.join(summary['helpers'])}")
+    
+    if context_parts:
+        return f"\n[이전 대화 참고]\n" + "\n".join(context_parts) + "\n자연스럽게 이전 대화 내용을 언급하며 시작하세요.\n"
+    
+    return ""
+
+def get_conversation_summary(conversation_history: list) -> str:
+    """대화 내용을 요약합니다."""
+    if len(conversation_history) < 2:
+        return "방금 대화를 시작했습니다"
+    
+    # 최근 5개 메시지에서 주요 내용 추출
+    recent_messages = conversation_history[-5:]
+    topics = []
+    
+    for msg in recent_messages:
+        if msg.get('role') == 'user':
+            content = msg.get('content', '')[:100]  # 100자까지만
+            if content:
+                topics.append(content)
+    
+    if topics:
+        return f"{', '.join(topics[:2])}"  # 최대 2개 토픽만 표시
+    
+    return "이전 대화 내용"
+
+def check_reset_keywords(message: str) -> bool:
+    """사용자 메시지가 리셋 키워드를 포함하는지 확인합니다."""
+    message_lower = message.lower().strip()
+    for pattern in RESET_PATTERNS:
+        if re.search(pattern, message_lower):
+            return True
+    return False
+
+def check_end_keywords(message: str) -> bool:
+    """사용자 메시지가 종료 키워드를 포함하는지 확인합니다."""
+    message_lower = message.lower().strip()
+    for pattern in END_PATTERNS:
+        if re.search(pattern, message_lower):
+            return True
+    return False
+
+def check_continue_keywords(message: str) -> bool:
+    """사용자 메시지가 계속하기 키워드를 포함하는지 확인합니다."""
+    message_lower = message.lower().strip()
+    for pattern in CONTINUE_PATTERNS:
+        if re.search(pattern, message_lower):
+            return True
+    return False
+
+def check_new_session_keywords(message: str) -> bool:
+    """사용자 메시지가 새 세션 키워드를 포함하는지 확인합니다."""
+    message_lower = message.lower().strip()
+    for pattern in NEW_SESSION_PATTERNS:
+        if re.search(pattern, message_lower):
+            return True
+    return False
+
+def check_crisis_keywords(message: str) -> bool:
+    """위기 상황 키워드를 확인합니다."""
+    message_lower = message.lower()
+    for pattern in CRISIS_PATTERNS:
+        if re.search(pattern, message_lower):
+            return True
+    return False
+
+def call_upstage_solar_api(messages, system_prompt=None):
+    """Upstage Solar Pro2 API를 호출합니다."""
+    api_url = "https://api.upstage.ai/v1/chat/completions"
+    api_key = os.environ.get("UPSTAGE_API_KEY")
+    
+    if not api_key:
+        logger.error("UPSTAGE_API_KEY environment variable not set")
+        return None
+    
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+    
+    # 최근 대화만 포함 (컨텍스트 제한)
+    recent_messages = messages[-6:] if len(messages) > 6 else messages
+    
+    # 메시지 형식 변환
+    formatted_messages = []
+    
+    # 시스템 프롬프트 추가 (메타 표현 금지 강화)
+    if system_prompt:
+        enhanced_prompt = f"""
+{system_prompt}
+
+🚫 절대 금지사항:
+1. 한 번에 반드시 딱 하나의 질문만 출력하고 즉시 종료
+2. 학생의 이전 답변을 다시 묻거나 구체화 요청 금지
+3. "(학생의 답변을 기다립니다)" 같은 괄호 표현 절대 금지
+4. 이모지는 사용하지 마세요
+5. 단계의 목표에 맞는 새로운 관점의 질문을 하세요
+
+출력 예시:
+좋은 예: "요즘 가장 힘든 일은 무엇인가요?"
+나쁜 예: "그 부분에 대해 좀 더 자세히 말해주실래요?"
+나쁜 예: "아까 말씀하신 그 문제가 구체적으로 어떤 건가요?"
+
+한 개의 새로운 질문만 출력하고 종료하세요."""
+        formatted_messages.append({"role": "system", "content": enhanced_prompt})
+    
+    # 대화 히스토리 추가 (최근 것만)
+    for m in recent_messages:
+        if isinstance(m, dict) and "role" in m and "content" in m:
+            formatted_messages.append({"role": m["role"], "content": m["content"]})
+    
+    payload = {
+        "model": "solar-pro2",
+        "messages": formatted_messages,
+        "max_tokens": 150,  # 토큰 제한
+        "temperature": 0.8,  # 다양성 증가
+        "stream": False
+    }
+    
+    try:
+        encoded = json.dumps(payload).encode("utf-8")
+        response = http.request(
+            "POST",
+            api_url,
+            body=encoded,
+            headers=headers,
+            timeout=30.0
+        )
+        
+        if response.status != 200:
+            logger.error(f"Upstage API returned status {response.status}: {response.data.decode('utf-8')}")
+            return None
+        
+        result = json.loads(response.data.decode("utf-8"))
+        
+        # 응답 추출 및 정제
+        if "choices" in result and len(result["choices"]) > 0:
+            response_text = result["choices"][0]["message"]["content"]
+            
+            # 첫 번째 질문만 추출 (물음표 기준)
+            if '?' in response_text:
+                # 첫 번째 물음표까지만 자르기
+                first_question = response_text.split('?')[0] + '?'
+                response_text = first_question
+            
+            # 메타 표현 제거
+            response_text = re.sub(r'\([^)]*\)', '', response_text)  # 모든 괄호 내용 제거
+            response_text = re.sub(r'\*[^*]*\*', '', response_text)  # * 표현 제거
+            
+            # 이모지 제거
+            response_text = re.sub(r'[😊💪🎉💙⏰🚫⚠️]+', '', response_text)
+            
+            # 여러 줄인 경우 첫 줄만
+            lines = response_text.strip().split('\n')
+            if lines:
+                response_text = lines[0].strip()
+            
+            return response_text
+        else:
+            logger.error(f"Unexpected response format from Upstage API: {result}")
+            return None
+        
+    except Exception as e:
+        logger.error(f"Error calling Upstage Solar API: {str(e)}")
+        return None
+
+def should_advance_stage(session_data: dict, user_message: str) -> bool:
+    """단계를 전환해야 하는지 판단합니다."""
+    stage_question_count = int(session_data.get('stage_question_count', 0))
+    current_stage = int(session_data.get('current_stage', 0))
+    conversation_history = session_data.get('conversation_history', [])
+    
+    # 수업 시간을 고려하여 단계별 최소/최대 질문 수 설정
+    stage_name = COACHING_STAGES[current_stage]
+    
+    # 단계별 질문 수 기준
+    stage_limits = {
+        "신뢰 형성": {"min": 2, "max": 3},
+        "현실 탐색": {"min": 3, "max": 4},
+        "목표 설정": {"min": 2, "max": 3},
+        "대안 탐색": {"min": 3, "max": 4},
+        "실행 계획": {"min": 2, "max": 3},
+        "정리 및 마무리": {"min": 2, "max": 3}
+    }
+    
+    limits = stage_limits.get(stage_name, {"min": 2, "max": 3})
+    
+    # 최대 질문 수를 넘으면 무조건 전환
+    if stage_question_count >= limits["max"]:
+        logger.info(f"Stage {stage_name}: max questions ({limits['max']}) reached, advancing")
+        return True
+    
+    # 최소 질문 수를 충족하지 못하면 계속
+    if stage_question_count < limits["min"]:
+        return False
+    
+    # 최소 질문 수 충족 후, 학생 답변의 충실도 체크
+    user_message_length = len(user_message.strip())
+    
+    # 짧은 답변(20자 미만)이 연속으로 나오면 단계 전환
+    if user_message_length < 20:
+        recent_user_messages = [msg['content'] for msg in conversation_history[-4:] if msg['role'] == 'user']
+        short_answers = sum(1 for msg in recent_user_messages if len(msg) < 20)
+        if short_answers >= 2:
+            logger.info(f"Stage {stage_name}: short answers detected, advancing")
+            return True
+    
+    # 충실한 답변이 나왔으면 전환
+    if user_message_length > 50:
+        logger.info(f"Stage {stage_name}: detailed answer received, advancing")
+        return True
+    
+    # 최종 단계인지 확인
+    if current_stage >= len(COACHING_STAGES) - 1:
+        return False
+    
+    return False
+
+def lambda_handler(event, context):
+    """AWS Lambda 진입점: 이벤트를 처리하고 적절한 응답을 반환."""
+    try:
+        logger.info("event 타입: %s, event: %s", type(event), event)
+        body = event.get('body', '{}')
+        if isinstance(body, str):
+            logger.info("raw body: %s", body)
+            try:
+                body = json.loads(body)
+            except json.JSONDecodeError as e:
+                logger.error("body 문자열을 json으로 변환 실패: %s", str(e))
+                body = {}
+        if not isinstance(body, dict):
+            logger.error("body가 dict가 아님: %s", type(body))
+            body = {}
+        logger.info("body after parsing: %s", body)
+
+        user_request = body.get('userRequest', {})
+        if not isinstance(user_request, dict):
+            logger.error("userRequest가 dict가 아님: %s", type(user_request))
+            user_request = {}
+        logger.info("userRequest after parsing: %s", user_request)
+
+        user_id = user_request.get('user', {}).get('id', 'unknown')
+        user_message = user_request.get('utterance', '')
+        logger.info("user_id: %s, user_message: %s", user_id, user_message)
+
+        session_manager = SessionManager()
+        session_data = session_manager.get_session(user_id)
+        
+        # 재개 확인이 필요한 경우
+        if session_manager.needs_resume_check(session_data) and not session_data.get('awaiting_resume_response', False):
+            # 대화 내용 요약
+            summary = get_conversation_summary(session_data.get('conversation_history', []))
+            
+            # 재개 확인 메시지 설정
+            coach_response = f"안녕하세요! 다시 만나서 반갑습니다. 😊\n\n우리가 마지막에 '{summary}'에 대해 이야기하고 있었는데요, 이어서 계속 진행하시겠어요? 아니면 새로운 주제로 시작하시겠어요?"
+            
+            # 재개 응답 대기 상태로 설정
+            session_data['awaiting_resume_response'] = True
+            session_manager.update_session(session_data)
+            
+            response_body = {
+                "version": "2.0",
+                "template": {
+                    "outputs": [
+                        {
+                            "simpleText": {
+                                "text": coach_response
+                            }
+                        }
+                    ]
+                }
+            }
+            
+            return {
+                "statusCode": 200,
+                "body": json.dumps(response_body, ensure_ascii=False),
+                "headers": {"Content-Type": "application/json; charset=utf-8"}
+            }
+        
+        # 재개 응답 대기 중인 경우
+        if session_data.get('awaiting_resume_response', False):
+            session_data['awaiting_resume_response'] = False
+            
+            if check_new_session_keywords(user_message) or check_reset_keywords(user_message):
+                # 새 세션 시작
+                session_data = session_manager.reset_session(user_id)
+                user_message = "안녕하세요, 코칭을 시작하고 싶습니다."
+                logger.info("New session started after resume check")
+            else:
+                # 기존 세션 계속
+                logger.info("Continuing previous session")
+        
+        # 일반적인 리셋/종료 키워드 체크
+        elif check_reset_keywords(user_message):
+            session_data = session_manager.reset_session(user_id)
+            user_message = "안녕하세요, 코칭을 시작하고 싶습니다."
+            logger.info("Session reset triggered by user")
+        elif check_end_keywords(user_message):
+            # 종료 시 세션 저장
+            if len(session_data.get('conversation_history', [])) > 0:
+                session_manager.save_completed_session(session_data)
+            
+            # 종료 응답 생성
+            coach_response = "오늘 함께 이야기 나눠줘서 정말 고마워요. 도움이 필요할 때 용기내서 손을 내밀 수 있다는 걸 기억해주세요. 언제든지 다시 이야기 나누고 싶으면 '다시 시작'이라고 말해주세요. 응원할게요! 💪😊"
+            
+            response_body = {
+                "version": "2.0",
+                "template": {
+                    "outputs": [
+                        {
+                            "simpleText": {
+                                "text": coach_response
+                            }
+                        }
+                    ]
+                }
+            }
+            
+            return {
+                "statusCode": 200,
+                "body": json.dumps(response_body, ensure_ascii=False),
+                "headers": {"Content-Type": "application/json; charset=utf-8"}
+            }
+        
+        # 위기 키워드 체크
+        if check_crisis_keywords(user_message):
+            session_data['crisis_detected'] = True
+            session_data['crisis_timestamp'] = datetime.utcnow().isoformat()
+            logger.warning(f"Crisis keywords detected for user {user_id}")
+        
+        if not isinstance(session_data, dict):
+            logger.error("session_data가 dict가 아님: %s", type(session_data))
+            session_data = session_manager.create_new_session(user_id)
+
+        conversation_history = session_data.get('conversation_history', [])
+        if not isinstance(conversation_history, list):
+            logger.error("conversation_history가 리스트가 아님, 초기화")
+            conversation_history = []
+
+        # 세션에 사용자 메시지 추가
+        session_data['conversation_history'].append({"role": "user", "content": user_message})
+
+        # 현재 단계 및 질문 카운트 가져오기
+        current_stage = int(session_data.get('current_stage', 0))
+        stage_question_count = int(session_data.get('stage_question_count', 0))
+        
+        # 단계별 시스템 프롬프트 설정
+        stage_name = COACHING_STAGES[current_stage]
+        
+        # 첫 단계이고 첫 질문인 경우 이전 세션 컨텍스트 추가
+        previous_context = ""
+        if current_stage == 0 and stage_question_count == 0:
+            previous_context = get_previous_context(user_id, session_manager)
+        
+        # 학생 대상 프롬프트 추가
+        system_prompt = f"""
+{STAGE_PROMPTS[stage_name].format(previous_context=previous_context)}
+
+현재 단계: {stage_name} ({current_stage + 1}/{len(COACHING_STAGES)})
+질문 횟수: {stage_question_count + 1}번째
+
+중요한 코칭 원칙:
+1. 학생의 답변을 깊이 파고들지 말고, 단계의 목표에 맞는 새로운 질문으로 전환하세요
+2. 같은 주제를 반복해서 묻지 마세요
+3. 학생이 충분히 답했다면 다음 관점의 질문으로 넘어가세요
+4. 단계별 목표를 달성하기 위한 핵심 질문을 하세요
+5. 학생의 답변이 짧아도 계속 파고들지 말고 다른 각도의 질문을 하세요
+
+⚠️ 출력 규칙 (반드시 준수):
+1. 딱 한 개의 질문만 출력
+2. 절대 두 번째 질문 금지
+3. 괄호 안에 아무것도 쓰지 마세요
+4. 마무리 단계가 아니면 마무리 멘트 금지
+5. 현재 단계에 맞는 질문만 하세요
+
+이전 질문과 중복되지 않도록 주의하세요.
+"""
+        
+        # 시간 체크 추가
+        session_duration = session_manager.get_session_duration(session_data)
+        if session_duration >= SESSION_TIME_LIMIT_MINUTES:
+            system_prompt += f"\n\n세션이 {SESSION_TIME_LIMIT_MINUTES}분을 넘어갔습니다. 대화를 마무리하는 방향으로 진행해주세요."
+        
+        # Upstage Solar Pro2 API 호출
+        coach_response = call_upstage_solar_api(
+            session_data['conversation_history'],
+            system_prompt=system_prompt
+        )
+        
+        if not coach_response:
+            coach_response = "죄송합니다. 응답 생성에 실패했습니다. 잠시 후 다시 시도해 주세요."
+        
+        # 위기 상황일 경우 도움 자원 안내 추가
+        if session_data.get('crisis_detected', False) and stage_question_count % 2 == 0:
+            coach_response += "\n\n💙 힘든 마음을 표현해줘서 정말 고마워요. 혼자가 아니에요. 담임선생님이나 상담선생님, 또는 청소년상담 1388에 연락해보는 것도 좋은 방법이에요."
+        
+        # 시간 제한 안내
+        if session_duration >= SESSION_TIME_LIMIT_MINUTES - 2 and session_duration < SESSION_TIME_LIMIT_MINUTES:
+            coach_response += "\n\n⏰ 곧 대화 시간이 마무리됩니다. 오늘 나눈 이야기 중에서 가장 중요한 부분을 생각해보세요."
+        
+        # 코치 응답 저장
+        session_data['conversation_history'].append({"role": "assistant", "content": coach_response})
+        
+        # 질문 카운트 증가
+        session_data['stage_question_count'] = int(session_data.get('stage_question_count', 0)) + 1
+        
+        # 단계 전환 로직 (메시지 추가 없이)
+        if should_advance_stage(session_data, user_message):
+            next_stage = current_stage + 1
+            
+            if next_stage < len(COACHING_STAGES):
+                # 다음 단계로 전환
+                session_data['current_stage'] = next_stage
+                session_data['stage_question_count'] = 0
+                
+                # 단계 전환 시 부드러운 연결 메시지 추가
+                transition_messages = {
+                    "현실 탐색": "그렇군요. 조금 더 구체적으로 이야기해볼까요?",
+                    "목표 설정": "상황을 잘 이해했어요. 이제 원하는 변화에 대해 생각해봐요.",
+                    "대안 탐색": "목표가 명확해졌네요. 도움받을 수 있는 방법을 찾아봐요.",
+                    "실행 계획": "좋은 방법들이 있네요. 구체적인 계획을 세워봐요.",
+                    "정리 및 마무리": "많은 이야기를 나눴네요. 오늘 대화를 정리해봐요."
+                }
+                
+                next_stage_name = COACHING_STAGES[next_stage]
+                if next_stage_name in transition_messages:
+                    coach_response = transition_messages[next_stage_name] + "\n\n" + coach_response
+                
+                logger.info(f"Stage advanced from {current_stage} to {next_stage}")
+            else:
+                # 모든 단계가 완료된 경우
+                completion_message = f"\n\n🎉 오늘 정말 의미있는 대화를 나눴어요! 도움이 필요할 때 용기내서 말할 수 있는 여러분이 정말 멋져요. 새로운 대화를 시작하고 싶으면 '다시 시작'이라고 말해주세요."
+                coach_response += completion_message
+                
+                # 완료된 세션 저장
+                session_manager.save_completed_session(session_data)
+                
+                logger.info("All coaching stages completed")
+        
+        # 세션 업데이트
+        session_manager.update_session(session_data)
+
+        # 카카오톡 응답 생성
+        response_body = {
+            "version": "2.0",
+            "template": {
+                "outputs": [
+                    {
+                        "simpleText": {
+                            "text": coach_response
+                        }
+                    }
+                ]
+            }
+        }
+        
+        # 디버깅 정보 로깅
+        logger.info(f"Current stage: {int(session_data.get('current_stage', 0))} ({COACHING_STAGES[int(session_data.get('current_stage', 0))]})")
+        logger.info(f"Question count: {int(session_data.get('stage_question_count', 0))}")
+        logger.info(f"Session duration: {session_duration} minutes")
+        logger.info(f"Crisis detected: {session_data.get('crisis_detected', False)}")
+        logger.info(f"Response: {coach_response[:100]}...")
+
+        return {
+            "statusCode": 200,
+            "body": json.dumps(response_body, ensure_ascii=False),
+            "headers": {"Content-Type": "application/json; charset=utf-8"}
+        }
+        
+    except Exception as e:
+        logger.error(f"Error in lambda_handler: {str(e)}", exc_info=True)
+        error_response = {
+            "version": "2.0",
+            "template": {
+                "outputs": [
+                    {
+                        "simpleText": {
+                            "text": "죄송합니다. 일시적인 오류가 발생했습니다. 잠시 후 다시 시도해주세요."
+                        }
+                    }
+                ]
+            }
+        }
+        return {
+            'statusCode': 200,
+            'body': json.dumps(error_response, ensure_ascii=False),
+            'headers': {
+                'Content-Type': 'application/json; charset=utf-8'
+            }
+        }
