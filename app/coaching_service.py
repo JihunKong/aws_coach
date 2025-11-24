@@ -48,6 +48,10 @@ class CoachingService:
 
             session_data = self.session_manager.get_session(user_id)
 
+            # 세션이 완료된 경우 처리
+            if session_data.get('session_completed', False):
+                return self._handle_completed_session(session_data, user_id, user_message)
+
             # 재개 확인이 필요한 경우
             if self.session_manager.needs_resume_check(session_data) and not session_data.get('awaiting_resume_response', False):
                 return self._handle_resume_check(session_data, user_message)
@@ -80,17 +84,78 @@ class CoachingService:
 
     def _handle_resume_check(self, session_data: dict, user_message: str) -> dict:
         """세션 재개 확인을 처리합니다."""
-        # 대화 내용 요약
-        summary = get_conversation_summary(session_data.get('conversation_history', []))
-
-        # 재개 확인 메시지 설정
-        coach_response = f"안녕하세요! 다시 만나서 반갑습니다. 😊\n\n우리가 마지막에 '{summary}'에 대해 이야기하고 있었는데요, 이어서 계속 진행하시겠어요? 아니면 새로운 주제로 시작하시겠어요?"
+        try:
+            # AI를 사용하여 재개 메시지 생성
+            coach_response = self._generate_resume_message(session_data)
+        except Exception as e:
+            logger.error(f"Error generating resume message: {str(e)}", exc_info=True)
+            # Fallback 메시지
+            coach_response = "안녕하세요! 다시 만나서 반갑습니다. 😊\n\n이어서 이전 대화를 계속 진행하시겠어요? 아니면 새로운 주제로 시작하시겠어요?"
 
         # 재개 응답 대기 상태로 설정
         session_data['awaiting_resume_response'] = True
         self.session_manager.update_session(session_data)
 
         return self._create_response(coach_response)
+
+    def _generate_resume_message(self, session_data: dict) -> str:
+        """AI를 사용하여 세션 재개 메시지를 생성합니다."""
+        conversation_history = session_data.get('conversation_history', [])
+        current_stage = int(session_data.get('current_stage', 0))
+        stage_name = COACHING_STAGES[current_stage]
+        crisis_detected = session_data.get('crisis_detected', False)
+
+        # 대화 이력이 너무 짧으면 간단한 메시지
+        if len(conversation_history) < 4:
+            return "안녕하세요! 다시 만나서 반갑습니다. 😊\n\n이어서 이전 대화를 계속 진행하시겠어요? 아니면 새로운 주제로 시작하시겠어요?"
+
+        # 최근 대화 이력 추출 (마지막 8-10개 메시지)
+        recent_history = conversation_history[-10:]
+
+        # AI 프롬프트 생성
+        system_prompt = f"""당신은 청소년 코칭봇입니다. 사용자와의 대화가 1시간 이상 중단되었다가 재개됩니다.
+
+**현재 상황:**
+- 코칭 단계: {stage_name} ({current_stage + 1}/{len(COACHING_STAGES)})
+- 위기 상황 감지: {'예' if crisis_detected else '아니오'}
+
+**요청사항:**
+아래 대화 내역을 분석하여 다음을 포함한 따뜻하고 개인화된 재개 메시지를 작성하세요:
+
+1. 반가운 인사 (이모지 포함)
+2. 지난 대화의 핵심 주제와 감정 상태를 자연스럽게 요약
+   - 단순히 마지막 문장을 반복하지 말고, 전체 맥락을 이해한 의미 있는 요약
+   - 사용자가 이야기했던 어려움, 감정, 고민의 본질을 담아내기
+3. 현재 코칭 단계에서 무엇을 다루고 있었는지
+4. "이어서 계속 진행하시겠어요? 아니면 새로운 주제로 시작하시겠어요?" 질문
+
+**중요:**
+- 진심으로 반기는 느낌을 전달하세요
+- 사용자의 용기와 노력을 인정하고 격려하세요
+- 자연스럽고 따뜻한 어조를 유지하세요
+- 마지막 문장을 그대로 복사하지 말고, 전체 대화의 본질을 파악하세요
+{"- 위기 상황이므로 더욱 세심하고 조심스럽게 접근하세요" if crisis_detected else ""}
+
+**출력 형식:**
+재개 메시지만 출력하세요. 다른 설명이나 주석은 포함하지 마세요.
+"""
+
+        # API 호출
+        try:
+            coach_response = self.api_client.call_api(
+                recent_history,
+                system_prompt=system_prompt
+            )
+
+            if not coach_response:
+                # API가 빈 응답을 반환한 경우 fallback
+                return "안녕하세요! 다시 만나서 반갑습니다. 😊\n\n이어서 이전 대화를 계속 진행하시겠어요? 아니면 새로운 주제로 시작하시겠어요?"
+
+            return coach_response
+
+        except Exception as e:
+            logger.error(f"Error calling AI API for resume message: {str(e)}")
+            raise
 
     def _handle_resume_response(self, session_data: dict, user_id: str, user_message: str) -> dict:
         """재개 응답을 처리합니다."""
@@ -118,6 +183,86 @@ class CoachingService:
 
         return self._create_response(coach_response)
 
+    def _handle_completed_session(self, session_data: dict, user_id: str, user_message: str) -> dict:
+        """완료된 세션 이후 메시지를 처리합니다."""
+        # '다시 시작' 키워드 체크
+        restart_keywords = ['다시 시작', '다시시작', '새로 시작', '새로시작', '처음부터', '리셋', '재시작']
+        if any(keyword in user_message for keyword in restart_keywords):
+            # 새 세션 시작
+            session_data = self.session_manager.reset_session(user_id)
+            user_message = "안녕하세요, 코칭을 시작하고 싶습니다."
+            logger.info("New session started after completion")
+            return self._handle_coaching(session_data, user_message, user_id)
+        else:
+            # 재시작 안내 메시지
+            coach_response = "오늘 대화는 마무리되었어요. 😊\n\n새로운 대화를 시작하고 싶으면 '다시 시작'이라고 말해주세요!"
+            return self._create_response(coach_response)
+
+    def _handle_session_completion(self, session_data: dict, user_message: str) -> dict:
+        """세션 완료 시 마지막 답변에 공감하고 종료합니다."""
+        try:
+            # AI로 공감 메시지 생성
+            empathy_prompt = """당신은 청소년 코칭봇입니다. 사용자가 마지막 질문에 답변했고, 이제 세션을 마무리해야 합니다.
+
+**요청사항:**
+사용자의 마지막 답변에 대해 짧고 따뜻한 공감 메시지를 작성하세요.
+
+**출력 조건:**
+1. 2-3문장 이내로 간결하게
+2. 사용자의 답변을 인정하고 격려
+3. 이모지 1-2개 포함
+4. 자연스럽고 따뜻한 어조
+
+**출력 형식:**
+공감 메시지만 출력하세요. 다른 질문이나 설명은 포함하지 마세요.
+
+예시:
+"힘들 때 도움을 요청하는 것이 중요하다는 걸 깨달았다니 정말 멋져요! 그 용기가 앞으로도 큰 힘이 될 거예요. 💪"
+"""
+
+            # 최근 대화 이력 (마지막 2-4개 메시지면 충분)
+            recent_history = session_data['conversation_history'][-4:]
+
+            empathy_message = self.api_client.call_api(
+                recent_history,
+                system_prompt=empathy_prompt
+            )
+
+            if not empathy_message:
+                # Fallback 공감 메시지
+                empathy_message = "소중한 이야기를 나눠줘서 정말 고마워요. 오늘 함께한 시간이 의미 있었기를 바라요. 💙"
+
+            # 종료 안내 메시지
+            completion_message = "\n\n🎉 오늘 정말 의미있는 대화를 나눴어요! 도움이 필요할 때 용기내서 말할 수 있는 여러분이 정말 멋져요. 새로운 대화를 시작하고 싶으면 '다시 시작'이라고 말해주세요."
+
+            # 전체 응답 구성
+            coach_response = empathy_message + completion_message
+
+            # 코치 응답을 대화 이력에 추가
+            session_data['conversation_history'].append({"role": "assistant", "content": coach_response})
+
+            # 세션 완료 플래그 설정
+            session_data['session_completed'] = True
+
+            # 완료된 세션 저장
+            self.session_manager.save_completed_session(session_data)
+
+            # 세션 업데이트
+            self.session_manager.update_session(session_data)
+
+            logger.info("Session completed successfully with empathy message")
+
+            return self._create_response(coach_response)
+
+        except Exception as e:
+            logger.error(f"Error in session completion: {str(e)}", exc_info=True)
+            # Fallback 종료 메시지
+            coach_response = "🎉 오늘 정말 의미있는 대화를 나눴어요! 도움이 필요할 때 용기내서 말할 수 있는 여러분이 정말 멋져요. 새로운 대화를 시작하고 싶으면 '다시 시작'이라고 말해주세요."
+            session_data['session_completed'] = True
+            self.session_manager.save_completed_session(session_data)
+            self.session_manager.update_session(session_data)
+            return self._create_response(coach_response)
+
     def _handle_coaching(self, session_data: dict, user_message: str, user_id: str) -> dict:
         """코칭 대화를 처리합니다."""
         try:
@@ -130,6 +275,15 @@ class CoachingService:
 
             # 단계별 시스템 프롬프트 설정
             stage_name = COACHING_STAGES[current_stage]
+
+            # 세션 종료 조건 체크 (AI 호출 전에 확인)
+            is_last_stage = current_stage >= len(COACHING_STAGES) - 1
+            limits = STAGE_LIMITS.get(stage_name, {"min": 2, "max": 3})
+            is_at_max_questions = stage_question_count >= limits["max"]
+
+            if is_last_stage and is_at_max_questions:
+                # 마지막 답변에 대한 공감 후 세션 종료
+                return self._handle_session_completion(session_data, user_message)
 
             # 첫 단계이고 첫 질문인 경우 이전 세션 컨텍스트 추가
             previous_context = ""
@@ -276,26 +430,16 @@ class CoachingService:
         """다음 단계로 전환합니다."""
         next_stage = current_stage + 1
 
-        if next_stage < len(COACHING_STAGES):
-            # 다음 단계로 전환
-            session_data['current_stage'] = next_stage
-            session_data['stage_question_count'] = 0
+        # 다음 단계로 전환
+        session_data['current_stage'] = next_stage
+        session_data['stage_question_count'] = 0
 
-            # 단계 전환 시 부드러운 연결 메시지 추가
-            next_stage_name = COACHING_STAGES[next_stage]
-            if next_stage_name in TRANSITION_MESSAGES:
-                coach_response = TRANSITION_MESSAGES[next_stage_name] + "\n\n" + coach_response
+        # 단계 전환 시 부드러운 연결 메시지 추가
+        next_stage_name = COACHING_STAGES[next_stage]
+        if next_stage_name in TRANSITION_MESSAGES:
+            coach_response = TRANSITION_MESSAGES[next_stage_name] + "\n\n" + coach_response
 
-            logger.info(f"Stage advanced from {current_stage} to {next_stage}")
-        else:
-            # 모든 단계가 완료된 경우
-            completion_message = f"\n\n🎉 오늘 정말 의미있는 대화를 나눴어요! 도움이 필요할 때 용기내서 말할 수 있는 여러분이 정말 멋져요. 새로운 대화를 시작하고 싶으면 '다시 시작'이라고 말해주세요."
-            coach_response += completion_message
-
-            # 완료된 세션 저장
-            self.session_manager.save_completed_session(session_data)
-
-            logger.info("All coaching stages completed")
+        logger.info(f"Stage advanced from {current_stage} to {next_stage}")
 
         return coach_response
 

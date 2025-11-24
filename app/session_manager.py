@@ -100,7 +100,8 @@ class SessionManager:
                 'session_end_time': datetime.utcnow().isoformat(),
                 'summary': summary,
                 'conversation_history': session_data.get('conversation_history', []),
-                'crisis_detected': session_data.get('crisis_detected', False)
+                'crisis_detected': session_data.get('crisis_detected', False),
+                'session_completed': True
             }
 
             completed_sessions_table.put_item(Item=completed_session)
@@ -164,7 +165,8 @@ class SessionManager:
             'session_start_time': datetime.utcnow().isoformat(),
             'last_active': datetime.utcnow().isoformat(),
             'awaiting_resume_response': False,
-            'crisis_detected': False
+            'crisis_detected': False,
+            'session_completed': False
         }
 
     def reset_session(self, user_id: str) -> dict:
