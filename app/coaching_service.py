@@ -391,6 +391,10 @@ class CoachingService:
         current_stage = int(session_data.get('current_stage', 0))
         conversation_history = session_data.get('conversation_history', [])
 
+        # 마지막 단계인 경우 절대 전환하지 않음
+        if current_stage >= len(COACHING_STAGES) - 1:
+            return False
+
         # 단계별 질문 수 기준
         stage_name = COACHING_STAGES[current_stage]
         limits = STAGE_LIMITS.get(stage_name, {"min": 2, "max": 3})
@@ -420,15 +424,16 @@ class CoachingService:
             logger.info(f"Stage {stage_name}: detailed answer received, advancing")
             return True
 
-        # 최종 단계인지 확인
-        if current_stage >= len(COACHING_STAGES) - 1:
-            return False
-
         return False
 
     def _advance_stage(self, session_data: dict, current_stage: int, coach_response: str) -> str:
         """다음 단계로 전환합니다."""
         next_stage = current_stage + 1
+
+        # 다음 단계가 존재하지 않으면 그대로 반환 (안전장치)
+        if next_stage >= len(COACHING_STAGES):
+            logger.warning(f"Cannot advance beyond last stage {current_stage}")
+            return coach_response
 
         # 다음 단계로 전환
         session_data['current_stage'] = next_stage
