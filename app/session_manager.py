@@ -166,7 +166,9 @@ class SessionManager:
             'last_active': datetime.utcnow().isoformat(),
             'awaiting_resume_response': False,
             'crisis_detected': False,
-            'session_completed': False
+            'session_completed': False,
+            'chosen_topic': None,
+            'topic_description': ''
         }
 
     def reset_session(self, user_id: str) -> dict:

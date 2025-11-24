@@ -329,6 +329,12 @@ class CoachingService:
             # 코치 응답 저장
             session_data['conversation_history'].append({"role": "assistant", "content": coach_response})
 
+            # 주제 선택 단계에서 사용자의 답변을 chosen_topic으로 저장
+            if current_stage == 0 and not session_data.get('chosen_topic'):
+                # 사용자가 처음으로 답변한 내용을 주제로 저장
+                session_data['chosen_topic'] = user_message[:100]  # 최대 100자까지 저장
+                logger.info(f"Chosen topic stored: {session_data['chosen_topic']}")
+
             # 질문 카운트 증가
             session_data['stage_question_count'] = stage_question_count + 1
 
@@ -362,11 +368,11 @@ class CoachingService:
 질문 횟수: {stage_question_count + 1}번째
 
 중요한 코칭 원칙:
-1. 학생의 답변을 깊이 파고들지 말고, 단계의 목표에 맞는 새로운 질문으로 전환하세요
+1. 사용자의 답변을 깊이 파고들지 말고, 단계의 목표에 맞는 새로운 질문으로 전환하세요
 2. 같은 주제를 반복해서 묻지 마세요
-3. 학생이 충분히 답했다면 다음 관점의 질문으로 넘어가세요
+3. 사용자가 충분히 답했다면 다음 관점의 질문으로 넘어가세요
 4. 단계별 목표를 달성하기 위한 핵심 질문을 하세요
-5. 학생의 답변이 짧아도 계속 파고들지 말고 다른 각도의 질문을 하세요
+5. 사용자의 답변이 짧아도 계속 파고들지 말고 다른 각도의 질문을 하세요
 
 ⚠️ 출력 규칙 (반드시 준수):
 1. 딱 한 개의 질문만 출력
@@ -377,6 +383,11 @@ class CoachingService:
 
 이전 질문과 중복되지 않도록 주의하세요.
 """
+
+        # 선택한 주제 컨텍스트 추가
+        chosen_topic = session_data.get('chosen_topic')
+        if chosen_topic and current_stage > 0:  # 첫 단계(주제 선택) 이후에만 추가
+            system_prompt += f"\n\n사용자가 선택한 주제: {chosen_topic}\n이 주제와 관련하여 질문하고 대화를 이어가세요."
 
         # 시간 체크 추가
         session_duration = self.session_manager.get_session_duration(session_data)
