@@ -269,6 +269,9 @@ class CoachingService:
             # 세션에 사용자 메시지 추가
             session_data['conversation_history'].append({"role": "user", "content": user_message})
 
+            # 사용자 응답 대기 플래그 해제 (사용자가 답변했음)
+            session_data['awaiting_user_response'] = False
+
             # 현재 단계 및 질문 카운트 가져오기
             current_stage = int(session_data.get('current_stage', 0))
             stage_question_count = int(session_data.get('stage_question_count', 0))
@@ -276,18 +279,23 @@ class CoachingService:
             # 단계별 시스템 프롬프트 설정
             stage_name = COACHING_STAGES[current_stage]
 
+            # 질문 카운트 증가 (사용자가 N번째 질문에 답변하고 있음)
+            stage_question_count += 1
+            session_data['stage_question_count'] = stage_question_count
+
             # 세션 종료 조건 체크 (AI 호출 전에 확인)
             is_last_stage = current_stage >= len(COACHING_STAGES) - 1
             limits = STAGE_LIMITS.get(stage_name, {"min": 2, "max": 3})
-            is_at_max_questions = stage_question_count >= limits["max"]
+            # 마지막 단계에서 최대 질문 수를 초과한 답변이면 종료
+            is_over_max_questions = stage_question_count > limits["max"]
 
-            if is_last_stage and is_at_max_questions:
+            if is_last_stage and is_over_max_questions:
                 # 마지막 답변에 대한 공감 후 세션 종료
                 return self._handle_session_completion(session_data, user_message)
 
             # 첫 단계이고 첫 질문인 경우 이전 세션 컨텍스트 추가
             previous_context = ""
-            if current_stage == 0 and stage_question_count == 0:
+            if current_stage == 0 and stage_question_count == 1:
                 previous_context = get_previous_context(user_id, self.session_manager)
 
             # 시스템 프롬프트 생성
@@ -335,19 +343,19 @@ class CoachingService:
                 session_data['chosen_topic'] = user_message[:100]  # 최대 100자까지 저장
                 logger.info(f"Chosen topic stored: {session_data['chosen_topic']}")
 
-            # 질문 카운트 증가
-            session_data['stage_question_count'] = stage_question_count + 1
-
             # 단계 전환 로직
             if self._should_advance_stage(session_data, user_message):
                 coach_response = self._advance_stage(session_data, current_stage, coach_response)
+
+            # 사용자 응답 대기 플래그 설정 (봇이 질문을 했고 답변을 기다림)
+            session_data['awaiting_user_response'] = True
 
             # 세션 업데이트
             self.session_manager.update_session(session_data)
 
             # 디버깅 정보 로깅
             logger.info(f"Current stage: {current_stage} ({COACHING_STAGES[current_stage]})")
-            logger.info(f"Question count: {stage_question_count + 1}")
+            logger.info(f"Question count: {stage_question_count}")
             logger.info(f"Session duration: {session_duration} minutes")
             logger.info(f"Response: {coach_response[:100]}...")
 

@@ -165,6 +165,7 @@ class SessionManager:
             'session_start_time': datetime.utcnow().isoformat(),
             'last_active': datetime.utcnow().isoformat(),
             'awaiting_resume_response': False,
+            'awaiting_user_response': False,
             'crisis_detected': False,
             'session_completed': False,
             'chosen_topic': None,
