@@ -1,0 +1,61 @@
+# Environment variables
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+ENV/
+env/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+logs/
+*.log
+
+# SSL certificates
+ssl/
+*.pem
+*.crt
+*.key
+
+# Docker
+*.tar
+
+# AWS
+*.pem
+*.ppk
+allocation-id.txt
+instance-id.txt
+public-ip.txt
+sg-id.txt
+
+# OS
+.DS_Store
+Thumbs.db
