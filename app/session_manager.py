@@ -169,7 +169,11 @@ class SessionManager:
             'crisis_detected': False,
             'session_completed': False,
             'chosen_topic': None,
-            'topic_description': ''
+            'topic_description': '',
+            # 맥락 연결 강화용 필드
+            'mentioned_people': [],     # 언급된 사람들
+            'key_points': [],           # 핵심 포인트들
+            'detected_emotions': []     # 감지된 감정들
         }
 
     def reset_session(self, user_id: str) -> dict:

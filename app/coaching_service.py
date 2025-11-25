@@ -5,14 +5,16 @@ import logging
 from datetime import datetime
 from .session_manager import SessionManager, SESSION_TIME_LIMIT_MINUTES, get_previous_context
 from .api_client import UpstageAPIClient
-from .prompts import COACHING_STAGES, STAGE_PROMPTS, STAGE_LIMITS, TRANSITION_MESSAGES
+from .prompts import COACHING_STAGES, STAGE_PROMPTS, STAGE_LIMITS, get_transition_message
 from .utils import (
     check_reset_keywords,
     check_end_keywords,
     check_continue_keywords,
     check_new_session_keywords,
     check_crisis_keywords,
-    get_conversation_summary
+    get_conversation_summary,
+    detect_emotions,
+    extract_mentioned_people
 )
 
 logger = logging.getLogger(__name__)
@@ -198,6 +200,35 @@ class CoachingService:
             coach_response = "오늘 대화는 마무리되었어요. 😊\n\n새로운 대화를 시작하고 싶으면 '다시 시작'이라고 말해주세요!"
             return self._create_response(coach_response)
 
+    def _generate_conversation_summary(self, session_data: dict) -> str:
+        """대화 요약을 생성합니다."""
+        conversation_history = session_data.get('conversation_history', [])
+        chosen_topic = session_data.get('chosen_topic', '')
+
+        # 대화가 너무 짧으면 요약 생략
+        if len(conversation_history) < 6:
+            return ""
+
+        summary_prompt = f"""당신은 코칭 세션 요약 전문가입니다.
+
+주제: {chosen_topic}
+
+다음 형식으로 대화를 요약하세요 (3-4문장):
+1. 오늘 나눈 핵심 주제
+2. 사용자가 발견한 통찰이나 깨달음
+3. 앞으로의 계획이나 다짐
+
+따뜻하고 구체적으로 작성하세요. 사용자가 실제로 말한 내용을 반영하세요.
+불필요한 설명 없이 요약만 출력하세요."""
+
+        try:
+            recent_messages = conversation_history[-12:]
+            summary = self.api_client.call_api(recent_messages, system_prompt=summary_prompt)
+            return summary if summary else ""
+        except Exception as e:
+            logger.error(f"Summary generation failed: {e}")
+            return ""
+
     def _handle_session_completion(self, session_data: dict, user_message: str) -> dict:
         """세션 완료 시 마지막 답변에 공감하고 종료합니다."""
         try:
@@ -232,11 +263,17 @@ class CoachingService:
                 # Fallback 공감 메시지
                 empathy_message = "소중한 이야기를 나눠줘서 정말 고마워요. 오늘 함께한 시간이 의미 있었기를 바라요. 💙"
 
-            # 종료 안내 메시지
-            completion_message = "\n\n🎉 오늘 정말 의미있는 대화를 나눴어요! 도움이 필요할 때 용기내서 말할 수 있는 여러분이 정말 멋져요. 새로운 대화를 시작하고 싶으면 '다시 시작'이라고 말해주세요."
+            # 대화 요약 생성
+            conversation_summary = self._generate_conversation_summary(session_data)
+            summary_section = ""
+            if conversation_summary:
+                summary_section = f"\n\n📝 오늘 대화 정리:\n{conversation_summary}"
 
-            # 전체 응답 구성
-            coach_response = empathy_message + completion_message
+            # 종료 안내 메시지
+            completion_message = "\n\n🎉 오늘 정말 의미있는 대화를 나눴어요! 새로운 대화를 시작하고 싶으면 '다시 시작'이라고 말해주세요."
+
+            # 전체 응답 구성 (공감 + 요약 + 종료)
+            coach_response = empathy_message + summary_section + completion_message
 
             # 코치 응답을 대화 이력에 추가
             session_data['conversation_history'].append({"role": "assistant", "content": coach_response})
@@ -271,6 +308,25 @@ class CoachingService:
 
             # 사용자 응답 대기 플래그 해제 (사용자가 답변했음)
             session_data['awaiting_user_response'] = False
+
+            # 감정 감지 (감정 인정 강화)
+            detected_emotions = detect_emotions(user_message)
+            if detected_emotions:
+                session_data['detected_emotions'] = detected_emotions
+            else:
+                session_data['detected_emotions'] = []
+
+            # 맥락 추출 (사람 언급 및 핵심 포인트)
+            mentioned = extract_mentioned_people(user_message)
+            if mentioned:
+                existing = session_data.get('mentioned_people', [])
+                session_data['mentioned_people'] = list(set(existing + mentioned))[-5:]  # 최대 5명
+
+            # 중요 포인트 저장 (50자 이상 답변)
+            if len(user_message) > 50:
+                key_points = session_data.get('key_points', [])
+                key_points.append(user_message[:100])
+                session_data['key_points'] = key_points[-3:]  # 최근 3개만 유지
 
             # 현재 단계 및 질문 카운트 가져오기
             current_stage = int(session_data.get('current_stage', 0))
@@ -408,6 +464,41 @@ class CoachingService:
         if chosen_topic and current_stage > 0:  # 첫 단계(주제 선택) 이후에만 추가
             system_prompt += f"\n\n사용자가 선택한 주제: {chosen_topic}\n이 주제와 관련하여 질문하고 대화를 이어가세요."
 
+        # 감정 인정 지침 추가 (감정이 감지된 경우)
+        detected_emotions = session_data.get('detected_emotions', [])
+        if detected_emotions:
+            emotion_names = {
+                'sadness': '슬픔/속상함',
+                'anxiety': '불안/걱정',
+                'frustration': '답답함/막막함',
+                'anger': '화남/짜증',
+                'positive': '기쁨/좋음'
+            }
+            emotion_labels = [emotion_names.get(e, e) for e in detected_emotions]
+            system_prompt += f"""
+
+⚠️ 감정 인정 원칙 (매우 중요):
+- 감지된 감정: {', '.join(emotion_labels)}
+- 질문 전에 먼저 1문장으로 감정을 인정하세요
+- "~하시는군요", "~가 느껴지네요" 형태로 자연스럽게 공감
+- 감정 인정 직후 바로 질문으로 연결 (별도 문장 금지)
+
+예시: "시험 결과 때문에 속상하셨겠어요. 어떤 부분이 가장 아쉬우셨나요?"
+"""
+
+        # 맥락 연결 정보 추가 (이전에 언급된 사람/주요 내용)
+        mentioned_people = session_data.get('mentioned_people', [])
+        key_points = session_data.get('key_points', [])
+
+        if (mentioned_people or key_points) and current_stage > 1:
+            context_section = "\n\n[이전 대화 맥락 - 자연스럽게 연결하세요]\n"
+            if mentioned_people:
+                context_section += f"- 언급된 사람: {', '.join(mentioned_people)}\n"
+            if key_points:
+                context_section += f"- 주요 내용: {key_points[-1][:50]}...\n"
+            context_section += "위 내용을 자연스럽게 연결하여 질문하세요.\n"
+            system_prompt += context_section
+
         # 시간 체크 추가
         session_duration = self.session_manager.get_session_duration(session_data)
         if session_duration >= SESSION_TIME_LIMIT_MINUTES:
@@ -469,10 +560,11 @@ class CoachingService:
         session_data['current_stage'] = next_stage
         session_data['stage_question_count'] = 0
 
-        # 단계 전환 시 부드러운 연결 메시지 추가
+        # 단계 전환 시 부드러운 연결 메시지 추가 (랜덤 선택)
         next_stage_name = COACHING_STAGES[next_stage]
-        if next_stage_name in TRANSITION_MESSAGES:
-            coach_response = TRANSITION_MESSAGES[next_stage_name] + "\n\n" + coach_response
+        transition_msg = get_transition_message(next_stage_name)
+        if transition_msg:
+            coach_response = transition_msg + "\n\n" + coach_response
 
         logger.info(f"Stage advanced from {current_stage} to {next_stage}")
 

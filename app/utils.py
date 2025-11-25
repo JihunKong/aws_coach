@@ -58,6 +58,20 @@ CRISIS_PATTERNS = [
     r'혼자\s*(?:인\s*것\s*같|라고\s*느껴|남겨|버려)', r'외로워', r'아무도\s*없'
 ]
 
+# 감정 패턴 (감정 인정 강화용)
+EMOTION_PATTERNS = {
+    'sadness': [r'슬퍼', r'슬프', r'우울', r'속상', r'힘들', r'지쳐'],
+    'anxiety': [r'불안', r'걱정', r'두려', r'무서', r'긴장'],
+    'frustration': [r'답답', r'막막', r'모르겠', r'어떻게'],
+    'anger': [r'화나', r'짜증', r'억울', r'열받'],
+    'positive': [r'기쁘', r'좋아', r'행복', r'설레', r'감사']
+}
+
+# 사람 언급 패턴 (맥락 연결용)
+PEOPLE_PATTERNS = [
+    r'(엄마|아빠|부모님|선생님|친구|언니|오빠|누나|형|동생|할머니|할아버지|남자친구|여자친구|선배|후배|반장|담임)'
+]
+
 
 def check_reset_keywords(message: str) -> bool:
     """사용자 메시지가 리셋 키워드를 포함하는지 확인합니다."""
@@ -102,6 +116,26 @@ def check_crisis_keywords(message: str) -> bool:
         if re.search(pattern, message_lower):
             return True
     return False
+
+
+def detect_emotions(message: str) -> list:
+    """사용자 메시지에서 감정을 감지합니다."""
+    detected = []
+    for emotion, patterns in EMOTION_PATTERNS.items():
+        for pattern in patterns:
+            if re.search(pattern, message):
+                detected.append(emotion)
+                break
+    return detected
+
+
+def extract_mentioned_people(message: str) -> list:
+    """메시지에서 언급된 사람들을 추출합니다."""
+    people = []
+    for pattern in PEOPLE_PATTERNS:
+        matches = re.findall(pattern, message)
+        people.extend(matches)
+    return list(set(people))
 
 
 def get_conversation_summary(conversation_history: list) -> str:
