@@ -10,16 +10,16 @@ from urllib3.util.retry import Retry
 
 logger = logging.getLogger(__name__)
 
-# HTTP 클라이언트 설정
+# HTTP 클라이언트 설정 (KakaoTalk 5초 타임아웃 준수)
 http = urllib3.PoolManager(
     maxsize=50,
     retries=Retry(
-        total=1,
+        total=0,  # 재시도 없음 (5초 제한 준수)
         backoff_factor=0.5,
         status_forcelist=[500, 502, 503, 504],
         allowed_methods=["POST"]
     ),
-    timeout=urllib3.Timeout(connect=3.0, read=8.0)
+    timeout=urllib3.Timeout(connect=1.0, read=3.5)  # 총 4.5초
 )
 
 
@@ -90,7 +90,7 @@ class UpstageAPIClient:
                 self.api_url,
                 body=encoded,
                 headers=headers,
-                timeout=urllib3.Timeout(connect=3.0, read=8.0)
+                timeout=urllib3.Timeout(connect=1.0, read=3.5)  # KakaoTalk 5초 제한
             )
 
             if response.status != 200:
